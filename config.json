@@ -1,0 +1,12 @@
+{
+  "colors": ["#0000FF", "#8000FF", "#FF0000"],
+  "speed": 3,
+  "brightness": 100,
+  "enabled": true,
+  "fps": 30,
+  "wave_length": 1.0,
+  "argb_leds": 0,
+  "openrgb_path": "",
+  "host": "127.0.0.1",
+  "port": 6742
+}
