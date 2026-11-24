@@ -37,6 +37,8 @@ DEFAULTS = {
 }
 # скорость 1..5 -> полных циклов палитры в секунду
 SPEEDS = {1: 0.04, 2: 0.08, 3: 0.15, 4: 0.3, 5: 0.6}
+SLEEP_GAP = 5.0      # если между кадрами прошло больше N секунд — ПК спал
+RESUME_DELAY = 8.0   # сколько ждать после пробуждения, пока Windows поднимет USB
 
 logging.basicConfig(
     filename=LOG_PATH, filemode="w", level=logging.INFO, encoding="utf-8",
@@ -167,16 +169,35 @@ def prepare(client, cfg):
                  len(dev.leds), ", ".join(f"{z.name}({len(z.leds)})" for z in dev.zones))
 
 
+def kill_openrgb():
+    r = subprocess.run(["taskkill", "/f", "/im", "OpenRGB.exe"], capture_output=True,
+                       creationflags=NO_WINDOW)
+    log.info("OpenRGB остановлен (код %d)", r.returncode)
+
+
+class Reinit(Exception):
+    """Нужно переподключиться и заново настроить устройства."""
+
+
 # ---------------------------------------------------------------- анимация
 class Animator(threading.Thread):
     def __init__(self, app):
         super().__init__(daemon=True)
         self.app = app
         self.stop = threading.Event()
+        self.reinit = threading.Event()
+        self.hard = False
+
+    def restart(self):
+        """Кнопка «Перезапустить подсветку»: перезапуск OpenRGB и устройств."""
+        self.hard = True
+        self.reinit.set()
 
     def run(self):
         while not self.stop.is_set():
+            client = None
             try:
+                self.reinit.clear()
                 client = connect(self.app.cfg, self.stop)
                 wait_devices(client, self.stop)
                 prepare(client, self.app.cfg)
@@ -185,16 +206,39 @@ class Animator(threading.Thread):
                 self.loop(client)
             except SystemExit:
                 return
+            except Reinit:
+                log.info("Перезапуск подсветки (полный: %s)", self.hard)
             except Exception as e:
                 log.exception("Ошибка, переподключение через 5 с")
                 self.app.notify(str(e)[:200])
                 self.stop.wait(5)
+            finally:
+                if client is not None:
+                    try:
+                        client.disconnect()
+                    except Exception:
+                        pass
+            if self.hard and not self.stop.is_set():
+                self.hard = False
+                kill_openrgb()
+                self.stop.wait(2)
 
     def loop(self, client):
         phase = 0.0
         last = time.perf_counter()
+        wall = time.time()
         was_on = None
         while not self.stop.is_set():
+            if self.reinit.is_set():
+                raise Reinit
+            # time.time() идёт и во время сна, поэтому большой скачок = ПК просыпался
+            now_wall = time.time()
+            if now_wall - wall > SLEEP_GAP:
+                log.info("ПК вышел из сна, через %.0f с перезапускаю подсветку", RESUME_DELAY)
+                self.stop.wait(RESUME_DELAY)
+                self.hard = True
+                raise Reinit
+            wall = now_wall
             cfg = self.app.cfg
             frame = 1.0 / max(5, int(cfg["fps"]))
             now = time.perf_counter()
@@ -287,6 +331,7 @@ class App:
             pystray.MenuItem("Подсветка включена",
                              lambda icon, item: self.update(enabled=not self.cfg["enabled"]),
                              checked=lambda item: self.cfg["enabled"], default=True),
+            pystray.MenuItem("Перезапустить подсветку", self.restart),
             pystray.MenuItem("Скорость", pystray.Menu(*[speed_item(s) for s in range(1, 6)])),
             pystray.MenuItem("Яркость", pystray.Menu(*[bright_item(b) for b in (25, 50, 75, 100)])),
             pystray.Menu.SEPARATOR,
@@ -298,6 +343,10 @@ class App:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", self.quit),
         )
+
+    def restart(self, icon, item):
+        self.notify("Перезапускаю подсветку…")
+        self.anim.restart()
 
     def toggle_autostart(self, icon, item):
         set_autostart(not self.autostart)
